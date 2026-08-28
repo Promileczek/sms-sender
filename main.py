@@ -3,6 +3,7 @@ import sys
 import re
 import json
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from colorama import init, Fore, Style
 
 # Inicjalizacja colorama dla Windowsa
@@ -275,29 +276,76 @@ def send_code(phone):
         return False, "; ".join(e.get("message", str(e)) for e in errors)
     return False, f"HTTP {resp.status_code}: {json.dumps(data)[:200]}"
 
+# --- InPost -------------------------------------------------------------------
+# Apka InPost Mobile (endpoint logowania po numerze telefonu, easypack24).
+# /v1/sendSMSCode to krok przed logowaniem — wysyła SMS z kodem, nie wymaga tokena.
+# Zweryfikowane: POST z {"phoneNumber": "..."} -> 200 {"expirationTime": "..."}.
+INPOST_BASE = "https://api-inmobile-pl.easypack24.net"
+
+def send_inpost_code(phone):
+    """Wysyła żądanie kodu SMS do InPost Mobile. Zwraca (ok, wiadomość)."""
+    url = f"{INPOST_BASE}/v1/sendSMSCode"
+    headers = {
+        "content-type": "application/json",
+        "user-agent": "okhttp/4.9.0",
+    }
+    body = {"phoneNumber": phone}
+
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=20)
+    except requests.RequestException as e:
+        return False, f"Błąd połączenia: {e}"
+
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
+
+    if resp.ok:
+        msg = "Kod wysłany"
+        if isinstance(data, dict) and data.get("expirationTime"):
+            msg += f" (wygasa {data['expirationTime']})"
+        return True, msg
+
+    if isinstance(data, dict):
+        err = data.get("message") or data.get("error") or json.dumps(data)[:200]
+        return False, f"HTTP {resp.status_code}: {err}"
+    return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+
+
+# --- Rejestr serwisów -------------------------------------------------------------
+# send:    fn(phone) -> (ok, msg)
+# refresh: fn() -> (ok, msg) wołane raz przy błędzie auth, potem ponowna wysyłka
+PROVIDERS = [
+    {"name": "Żabka", "send": send_code, "refresh": refresh_bearer_token},
+    {"name": "InPost", "send": send_inpost_code, "refresh": None},
+]
+
+def send_with_retry(provider, phone):
+    """Wysyła kod jednym serwisem, z jednorazowym odświeżeniem tokena przy błędzie auth."""
+    ok, message = provider["send"](phone)
+    if not ok and provider.get("refresh") and is_auth_error(message):
+        refreshed, refresh_msg = provider["refresh"]()
+        if refreshed:
+            ok, message = provider["send"](phone)
+        else:
+            ok, message = False, refresh_msg
+    return provider["name"], ok, message
+
 def option_1():
     phone = ask_phone()
     print()
-    print_box([f"{Fore.CYAN}➤ Wysyłanie kodu na {phone}...{RESET}"], color=Fore.CYAN)
+    names = ", ".join(p["name"] for p in PROVIDERS)
+    print_box([f"{Fore.CYAN}➤ Wysyłanie kodu na {phone} ({names})...{RESET}"], color=Fore.CYAN)
 
-    ok, message = send_code(phone)
-
-    if not ok and is_auth_error(message):
-        print()
-        print_box([f"{Fore.YELLOW}↻ Token wygasł, odświeżanie...{RESET}"], color=Fore.YELLOW)
-        refreshed, refresh_msg = refresh_bearer_token()
-        if refreshed:
-            print()
-            print_box([f"{Fore.CYAN}➤ Ponowna próba wysyłki na {phone}...{RESET}"], color=Fore.CYAN)
-            ok, message = send_code(phone)
-        else:
-            ok, message = False, refresh_msg
+    with ThreadPoolExecutor(max_workers=len(PROVIDERS)) as ex:
+        results = list(ex.map(lambda p: send_with_retry(p, phone), PROVIDERS))
 
     print()
-    if ok:
-        print_box([f"{Fore.GREEN}✔ {message}{RESET}"], color=Fore.GREEN)
-    else:
-        print_box([f"{Fore.RED}✖ {message}{RESET}"], color=Fore.RED)
+    for name, ok, message in results:
+        color = Fore.GREEN if ok else Fore.RED
+        mark = "✔" if ok else "✖"
+        print_box([f"{color}{mark} [{name}] {message}{RESET}"], color=color)
 
     input(f"\n{Style.DIM}Naciśnij Enter aby wrócić...{RESET}")
 
