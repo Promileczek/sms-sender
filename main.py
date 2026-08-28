@@ -313,12 +313,87 @@ def send_inpost_code(phone):
     return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
 
 
+# --- TikTok -------------------------------------------------------------------
+# Endpoint webowy passport TikToka (com.zhiliaoapp.musically).
+# passport/web/send_code/ wysyła SMS lub dzwoni (voice) z kodem weryfikacyjnym.
+# Nie wymaga podpisu X-Argus/X-Gorgon — wystarczy sesja przeglądarkowa z cookies + CSRF.
+TIKTOK_BASE = "https://www.tiktok.com"
+TIKTOK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+def _get_tiktok_session():
+    """Tworzy sesję z cookies (ttwid, tt_csrf_token) jak prawdziwa przeglądarka."""
+    s = requests.Session()
+    s.headers.update({
+        "user-agent": TIKTOK_UA,
+        "referer": f"{TIKTOK_BASE}/login/phone-or-email/phone",
+        "origin": TIKTOK_BASE,
+    })
+    try:
+        s.get(f"{TIKTOK_BASE}/login/phone-or-email/phone", timeout=15)
+    except requests.RequestException:
+        pass  # cookies mogą przyjść mimo błędu
+    return s
+
+def _send_tiktok(phone, channel):
+    """Wspólna logika dla TikTok SMS i Voice Call. Zwraca (ok, wiadomość)."""
+    s = _get_tiktok_session()
+    csrf = s.cookies.get("tt_csrf_token", "")
+
+    url = f"{TIKTOK_BASE}/passport/web/send_code/"
+    headers = {
+        "content-type": "application/x-www-form-urlencoded",
+    }
+    if csrf:
+        headers["x-tt-passport-csrf-token"] = csrf
+
+    body = {
+        "mobile": phone,
+        "region": "PL",
+        "type": "0",
+        "channel": channel,   # "sms" lub "voice"
+        "aid": "1459",
+    }
+
+    try:
+        resp = s.post(url, headers=headers, data=body, timeout=20)
+    except requests.RequestException as e:
+        return False, f"Błąd połączenia: {e}"
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return resp.ok, f"HTTP {resp.status_code}: {resp.text[:200]}"
+
+    msg_field = data.get("message", "")
+    err_code = data.get("data", {}).get("error_code", 0)
+    desc = data.get("data", {}).get("description", "")
+
+    if msg_field == "success" or err_code == 0:
+        return True, "Kod wysłany" if channel == "sms" else "Rozmowa zainicjowana"
+
+    if err_code == 7:
+        return False, "Za dużo prób — spróbuj później"
+    if desc:
+        return False, desc
+    return False, f"error_code={err_code}: {json.dumps(data)[:200]}"
+
+def send_tiktok_sms(phone):
+    """Wysyła SMS z kodem weryfikacyjnym TikTok. Zwraca (ok, wiadomość)."""
+    return _send_tiktok(phone, "sms")
+
+def send_tiktok_voice(phone):
+    """Inicjuje rozmowę telefoniczną z kodem TikTok. Zwraca (ok, wiadomość)."""
+    return _send_tiktok(phone, "voice")
+
+
 # --- Rejestr serwisów -------------------------------------------------------------
 # send:    fn(phone) -> (ok, msg)
 # refresh: fn() -> (ok, msg) wołane raz przy błędzie auth, potem ponowna wysyłka
 PROVIDERS = [
     {"name": "Żabka", "send": send_code, "refresh": refresh_bearer_token},
     {"name": "InPost", "send": send_inpost_code, "refresh": None},
+    {"name": "TikTok SMS", "send": send_tiktok_sms, "refresh": None},
+    {"name": "TikTok ☎", "send": send_tiktok_voice, "refresh": None},
 ]
 
 def send_with_retry(provider, phone):
